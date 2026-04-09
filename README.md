@@ -64,9 +64,32 @@ The API startup checks and applies pending migrations once; already-applied migr
 
 ## Docker Notes
 
-The API container includes `ffmpeg` and `yt-dlp`. For authenticated `yt-dlp` access in Docker, mount a Netscape-format cookies file into the container and point `storage.ytDlpCookiesPath` at that mounted file only when cookies are actually needed.
+The API container includes `ffmpeg` and `yt-dlp`.
 
-For local development, leave both cookie settings empty unless plain `yt-dlp` is not enough. On this machine, plain `yt-dlp` works while `--cookies-from-browser chrome` does not, so cookie auth should be opt-in rather than default.
+For local development, leave both cookie settings empty unless plain `yt-dlp` is not enough.
+
+For Docker, the default setup now uses Firefox cookies via `yt-dlp --cookies-from-browser firefox`. Mount the Ubuntu Firefox profile directory into the container and let the env override drive the browser selection:
+
+```bash
+export MEDIA_INGEST_FIREFOX_DIR="$HOME/.mozilla/firefox"
+docker compose up -d api
+```
+
+If your Ubuntu host uses the Firefox Snap layout, use:
+
+```bash
+export MEDIA_INGEST_FIREFOX_DIR="$HOME/snap/firefox/common/.mozilla/firefox"
+docker compose up -d api
+```
+
+If `yt-dlp` needs a specific Firefox profile, override the selector:
+
+```bash
+export YT_DLP_COOKIES_FROM_BROWSER='firefox:default-release'
+docker compose up -d api
+```
+
+The container mounts the Firefox data under `/root/.mozilla/firefox`, which is the path `yt-dlp` expects for Firefox on Linux.
 
 ## Google Auth Notes
 

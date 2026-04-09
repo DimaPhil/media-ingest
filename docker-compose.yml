@@ -5,12 +5,12 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       MEDIA_INGEST_CONFIG_PATH: /app/config/app.yaml
-      YT_DLP_COOKIES_PATH: /var/run/media-ingest/cookies/youtube-cookies.txt
+      YT_DLP_COOKIES_FROM_BROWSER: ${YT_DLP_COOKIES_FROM_BROWSER:-firefox}
     ports:
       - '3000:3000'
     volumes:
       - ./config/app.example.yaml:/app/config/app.yaml:ro
-      - ${MEDIA_INGEST_COOKIES_DIR:-./.cookies}:/var/run/media-ingest/cookies:ro
+      - ${MEDIA_INGEST_FIREFOX_DIR}:/root/.mozilla/firefox:ro
       - media-ingest-tmp:/app/.tmp
 
 volumes:
