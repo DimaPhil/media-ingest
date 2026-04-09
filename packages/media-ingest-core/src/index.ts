@@ -5,5 +5,6 @@ export * from './fingerprint';
 export * from './media';
 export * from './pipeline';
 export * from './providers';
+export * from './source-validation';
 export * from './sources';
 export * from './types';

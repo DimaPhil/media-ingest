@@ -16,6 +16,7 @@ import {
 } from 'drizzle-orm/pg-core';
 import postgres from 'postgres';
 
+import type { OperationRequest } from './contracts';
 import type {
   OperationError,
   OperationKind,
@@ -98,7 +99,7 @@ export interface PersistedOperation {
   model: string | null;
   sourceType: SourceKind;
   sourceLocator: Record<string, unknown>;
-  input: Record<string, unknown>;
+  input: OperationRequest;
   result: OperationResult | null;
   error: OperationError | null;
   cacheEnabled: boolean;
@@ -136,7 +137,7 @@ export interface CreateOperationInput {
   model: string | null;
   sourceType: SourceKind;
   sourceLocator: Record<string, unknown>;
-  input: Record<string, unknown>;
+  input: OperationRequest;
   cacheEnabled: boolean;
   workingDirectory: string | null;
 }

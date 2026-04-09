@@ -10,6 +10,7 @@ import { google } from 'googleapis';
 
 import type { AppConfig } from './config';
 import type { MediaSourceInput } from './contracts';
+import { parseGoogleDriveFileId, parseTelegramUri } from './source-validation';
 
 const execFile = promisify(execFileCb);
 
@@ -52,6 +53,17 @@ async function downloadToFile(
   await pipeline(Readable.fromWeb(response.body), createWriteStream(destinationPath));
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isReadableNodeStream(value: unknown): value is NodeJS.ReadableStream {
+  return value !== null
+    && typeof value === 'object'
+    && 'pipe' in value
+    && typeof value.pipe === 'function';
+}
+
 function requireSingleMedia(items: Array<{ media_id: string; file_name?: string; mime_type?: string }>): {
   mediaId: string;
   fileName: string;
@@ -72,38 +84,6 @@ function requireSingleMedia(items: Array<{ media_id: string; file_name?: string;
     fileName: item.file_name ?? `telegram-${item.media_id}`,
     mimeType: item.mime_type,
   };
-}
-
-function parseGoogleDriveFileId(uri: string): string {
-  const parsed = new URL(uri);
-  if (parsed.searchParams.has('id')) {
-    return parsed.searchParams.get('id') ?? '';
-  }
-  const match = parsed.pathname.match(/\/d\/([^/]+)/);
-  if (!match?.[1]) {
-    throw new Error('Unsupported Google Drive URL');
-  }
-  return match[1];
-}
-
-function parseTelegramUri(uri: string): { chatRef: string; messageId: number } {
-  const parsed = new URL(uri);
-  const pathParts = parsed.pathname.split('/').filter(Boolean);
-  if (parsed.hostname === 't.me' || parsed.hostname === 'telegram.me') {
-    if (pathParts[0] === 'c' && pathParts[1] && pathParts[2]) {
-      return {
-        chatRef: `-100${pathParts[1]}`,
-        messageId: Number(pathParts[2]),
-      };
-    }
-    if (pathParts[0] && pathParts[1]) {
-      return {
-        chatRef: `@${pathParts[0]}`,
-        messageId: Number(pathParts[1]),
-      };
-    }
-  }
-  throw new Error('Unsupported Telegram post URL');
 }
 
 function safeFileName(name: string): string {
@@ -212,7 +192,7 @@ class YtDlpSourceResolver implements SourceResolver {
   }
 
   private isCookieLookupFailure(error: unknown): boolean {
-    const details = error as { stderr?: string; message?: string } | undefined;
+    const details = isRecord(error) ? error : undefined;
     const text = `${details?.message ?? ''}\n${details?.stderr ?? ''}`;
     return /could not find .*cookies database/i.test(text)
       || (/FileNotFoundError/i.test(text) && /cookies/i.test(text))
@@ -237,7 +217,11 @@ class YtDlpSourceResolver implements SourceResolver {
       '--no-playlist',
       source.uri,
     ]);
-    const metadata = JSON.parse(stdout) as Record<string, unknown>;
+    const parsed = JSON.parse(stdout);
+    if (!isRecord(parsed)) {
+      throw new Error('yt-dlp returned an unexpected metadata payload');
+    }
+    const metadata = parsed;
     if (metadata.entries) {
       throw new Error('Playlists are not supported in v1');
     }
@@ -342,7 +326,10 @@ class GoogleDriveSourceResolver implements SourceResolver {
       },
     );
     const targetPath = join(destinationDirectory, safeFileName(source.fileName));
-    await pipeline(response.data as NodeJS.ReadableStream, createWriteStream(targetPath));
+    if (!isReadableNodeStream(response.data)) {
+      throw new Error('Drive download did not return a readable stream');
+    }
+    await pipeline(response.data, createWriteStream(targetPath));
     return {
       localPath: targetPath,
       fileName: source.fileName,

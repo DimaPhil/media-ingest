@@ -78,22 +78,19 @@ export interface LoadConfigOptions {
   env?: NodeJS.ProcessEnv;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
 function deepMerge<T extends Record<string, unknown>>(base: T, override: Record<string, unknown>): T {
   const result: Record<string, unknown> = { ...base };
   for (const [key, value] of Object.entries(override)) {
     if (
-      value &&
-      typeof value === 'object' &&
-      !Array.isArray(value) &&
+      isPlainObject(value) &&
       key in result &&
-      result[key] &&
-      typeof result[key] === 'object' &&
-      !Array.isArray(result[key])
+      isPlainObject(result[key])
     ) {
-      result[key] = deepMerge(
-        result[key] as Record<string, unknown>,
-        value as Record<string, unknown>,
-      );
+      result[key] = deepMerge(result[key], value);
       continue;
     }
     result[key] = value;
@@ -121,7 +118,8 @@ function parseConfigFile(configPath?: string): Record<string, unknown> {
     return {};
   }
   const raw = readFileSync(configPath, 'utf8');
-  return YAML.parse(raw) as Record<string, unknown>;
+  const parsed = YAML.parse(raw);
+  return isPlainObject(parsed) ? parsed : {};
 }
 
 function findDefaultConfigPath(startDirectory = process.cwd()): string | undefined {

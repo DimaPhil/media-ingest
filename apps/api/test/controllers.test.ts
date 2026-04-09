@@ -1,12 +1,12 @@
+import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
-import { describe, expect, it, vi } from 'vitest';
-import { ZodError } from 'zod';
+import request from 'supertest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { RemoteOperationService, type AppConfig } from '@media-ingest/core';
 
 import { HealthController, OperationsController } from '../src/controllers';
 import { APP_CONFIG } from '../src/tokens';
-import type { AppConfig } from '@media-ingest/core';
-import { RemoteOperationService } from '@media-ingest/core';
 
 const config: AppConfig = {
   app: { env: 'test', host: '127.0.0.1', port: 3000, pollAfterMs: 10 },
@@ -51,140 +51,242 @@ const config: AppConfig = {
   },
 };
 
+const validOperationId = 'd7f2936b-781d-4bd2-8f42-935f6ec1121f';
+const validTranscriptionRequest = {
+  source: {
+    kind: 'youtube',
+    uri: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+  },
+  provider: 'openai',
+  model: 'gpt-4o-transcribe',
+  force: false,
+};
+
+const apps: INestApplication[] = [];
+
+async function createApp(overrides: Partial<Record<keyof RemoteOperationService, unknown>> = {}) {
+  const operations = {
+    submitTranscription: vi.fn().mockResolvedValue({
+      operationId: validOperationId,
+      status: 'queued',
+      cacheHit: false,
+      pollAfterMs: 10,
+      dedupeKey: 'dedupe-1',
+    }),
+    submitUnderstanding: vi.fn().mockResolvedValue({
+      operationId: validOperationId,
+      status: 'queued',
+      cacheHit: false,
+      pollAfterMs: 10,
+      dedupeKey: 'dedupe-2',
+    }),
+    getOperationStatus: vi.fn().mockResolvedValue({
+      operation: { id: validOperationId, status: 'completed' },
+    }),
+    getAdminOverview: vi.fn().mockResolvedValue({ counts: { total: 1 } }),
+    listOperations: vi.fn().mockResolvedValue([{ id: validOperationId, status: 'running' }]),
+    ...overrides,
+  };
+
+  const moduleRef = await Test.createTestingModule({
+    controllers: [HealthController, OperationsController],
+    providers: [
+      { provide: APP_CONFIG, useValue: config },
+      { provide: RemoteOperationService, useValue: operations },
+    ],
+  }).compile();
+
+  const app = moduleRef.createNestApplication();
+  await app.init();
+  apps.push(app);
+
+  return { app, operations };
+}
+
+afterEach(async () => {
+  await Promise.all(apps.splice(0).map((app) => app.close()));
+});
+
 describe('API controllers', () => {
   it('returns health information', async () => {
-    const moduleRef = await Test.createTestingModule({
-      controllers: [HealthController],
-      providers: [{ provide: APP_CONFIG, useValue: config }],
-    }).compile();
+    const { app } = await createApp();
 
-    expect(moduleRef.get(HealthController).healthz()).toEqual({
-      status: 'ok',
-      env: 'test',
-    });
+    await request(app.getHttpServer())
+      .get('/healthz')
+      .expect(200)
+      .expect({
+        status: 'ok',
+        env: 'test',
+      });
   });
 
   it('renders the admin page shell', async () => {
-    const moduleRef = await Test.createTestingModule({
-      controllers: [HealthController],
-      providers: [{ provide: APP_CONFIG, useValue: config }],
-    }).compile();
+    const { app } = await createApp();
 
-    const response = {
-      type: vi.fn().mockReturnThis(),
-      send: vi.fn(),
-    };
+    const response = await request(app.getHttpServer())
+      .get('/admin')
+      .expect(200);
 
-    moduleRef.get(HealthController).admin(response as never);
-    expect(response.type).toHaveBeenCalledWith('html');
-    expect(response.send).toHaveBeenCalledWith(expect.stringContaining('Media Ingest Control Room'));
+    expect(response.text).toContain('Media Ingest Control Room');
   });
 
-  it('delegates operation lookup to the service', async () => {
-    const operations = {
-      getOperationStatus: vi.fn().mockResolvedValue({ operation: { id: 'op-1', status: 'completed' } }),
-    };
-    const moduleRef = await Test.createTestingModule({
-      controllers: [OperationsController],
-      providers: [
-        { provide: APP_CONFIG, useValue: config },
-        { provide: RemoteOperationService, useValue: operations },
-      ],
-    }).compile();
+  it('accepts valid transcription requests at the HTTP boundary', async () => {
+    const { app, operations } = await createApp();
 
-    const controller = moduleRef.get(OperationsController);
-    await expect(controller.getOperation('op-1')).resolves.toEqual({
-      operation: { id: 'op-1', status: 'completed' },
-    });
-    expect(operations.getOperationStatus).toHaveBeenCalledWith('op-1');
+    await request(app.getHttpServer())
+      .post('/v1/transcriptions')
+      .send(validTranscriptionRequest)
+      .expect(202)
+      .expect({
+        operationId: validOperationId,
+        status: 'queued',
+        cacheHit: false,
+        pollAfterMs: 10,
+        dedupeKey: 'dedupe-1',
+      });
+
+    expect(operations.submitTranscription).toHaveBeenCalledWith(validTranscriptionRequest);
   });
 
-  it('maps validation errors to bad request responses', async () => {
-    const operations = {
-      submitTranscription: vi.fn().mockRejectedValue(new ZodError([])),
-    };
-    const moduleRef = await Test.createTestingModule({
-      controllers: [OperationsController],
-      providers: [
-        { provide: APP_CONFIG, useValue: config },
-        { provide: RemoteOperationService, useValue: operations },
-      ],
-    }).compile();
+  it('rejects invalid source URLs before dispatching work', async () => {
+    const { app, operations } = await createApp();
 
-    const controller = moduleRef.get(OperationsController);
-    await expect(controller.createTranscription({})).rejects.toBeInstanceOf(BadRequestException);
+    const response = await request(app.getHttpServer())
+      .post('/v1/transcriptions')
+      .send({
+        ...validTranscriptionRequest,
+        source: {
+          kind: 'youtube',
+          uri: 'https://example.com/video.mp4',
+        },
+      })
+      .expect(400);
+
+    expect(response.body.message).toBe('Validation failed');
+    expect(response.body.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          message: 'Unsupported YouTube URL',
+          path: ['source', 'uri'],
+        }),
+      ]),
+    );
+    expect(operations.submitTranscription).not.toHaveBeenCalled();
+  });
+
+  it('rejects unsupported Google Drive folders at the HTTP boundary', async () => {
+    const { app, operations } = await createApp();
+
+    const response = await request(app.getHttpServer())
+      .post('/v1/understanding')
+      .send({
+        source: {
+          kind: 'google_drive',
+          uri: 'https://drive.google.com/drive/folders/abc123',
+        },
+        provider: 'google-gemini',
+        prompt: 'Summarize the video.',
+      })
+      .expect(400);
+
+    expect(response.body.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          message: 'Google Drive folders are not supported in v1',
+          path: ['source', 'uri'],
+        }),
+      ]),
+    );
+    expect(operations.submitUnderstanding).not.toHaveBeenCalled();
+  });
+
+  it('delegates operation lookup to the service after validating the id', async () => {
+    const { app, operations } = await createApp();
+
+    await request(app.getHttpServer())
+      .get(`/v1/operations/${validOperationId}`)
+      .expect(200)
+      .expect({
+        operation: { id: validOperationId, status: 'completed' },
+      });
+
+    expect(operations.getOperationStatus).toHaveBeenCalledWith(validOperationId);
+  });
+
+  it('rejects invalid operation ids before calling the service', async () => {
+    const { app, operations } = await createApp();
+
+    const response = await request(app.getHttpServer())
+      .get('/v1/operations/not-a-uuid')
+      .expect(400);
+
+    expect(response.body.message).toBe('Validation failed');
+    expect(operations.getOperationStatus).not.toHaveBeenCalled();
   });
 
   it('returns filtered admin operations lists', async () => {
-    const operations = {
-      listOperations: vi.fn().mockResolvedValue([{ id: 'op-2', status: 'running' }]),
-    };
-    const moduleRef = await Test.createTestingModule({
-      controllers: [OperationsController],
-      providers: [
-        { provide: APP_CONFIG, useValue: config },
-        { provide: RemoteOperationService, useValue: operations },
-      ],
-    }).compile();
+    const { app, operations } = await createApp();
 
-    const controller = moduleRef.get(OperationsController);
-    await expect(controller.listOperations('25', 'running', 'transcription', 'openai', 'http')).resolves.toEqual({
-      items: [{ id: 'op-2', status: 'running' }],
-      meta: { limit: 25, count: 1 },
+    await request(app.getHttpServer())
+      .get('/v1/admin/operations?limit=25&status=running&kind=transcription&provider=openai&sourceType=http')
+      .expect(200)
+      .expect({
+        items: [{ id: validOperationId, status: 'running' }],
+        meta: { limit: 25, count: 1 },
+      });
+
+    expect(operations.listOperations).toHaveBeenCalledWith({
+      limit: 25,
+      status: 'running',
+      kind: 'transcription',
+      provider: 'openai',
+      sourceType: 'http',
     });
+  });
+
+  it('rejects invalid admin query parameters before hitting the service', async () => {
+    const { app, operations } = await createApp();
+
+    await request(app.getHttpServer())
+      .get('/v1/admin/operations?limit=999')
+      .expect(400);
+
+    expect(operations.listOperations).not.toHaveBeenCalled();
   });
 
   it('returns admin overview payloads', async () => {
-    const operations = {
-      getAdminOverview: vi.fn().mockResolvedValue({ counts: { total: 1 } }),
-    };
-    const moduleRef = await Test.createTestingModule({
-      controllers: [OperationsController],
-      providers: [
-        { provide: APP_CONFIG, useValue: config },
-        { provide: RemoteOperationService, useValue: operations },
-      ],
-    }).compile();
+    const { app } = await createApp();
 
-    await expect(moduleRef.get(OperationsController).getAdminOverview()).resolves.toEqual({
-      counts: { total: 1 },
-    });
+    await request(app.getHttpServer())
+      .get('/v1/admin/overview')
+      .expect(200)
+      .expect({
+        counts: { total: 1 },
+      });
   });
 
   it('maps missing operations to not found responses', async () => {
-    const operations = {
-      getOperationStatus: vi.fn().mockRejectedValue(new Error('Operation not found: missing')),
-    };
-    const moduleRef = await Test.createTestingModule({
-      controllers: [OperationsController],
-      providers: [
-        { provide: APP_CONFIG, useValue: config },
-        { provide: RemoteOperationService, useValue: operations },
-      ],
-    }).compile();
+    const { app } = await createApp({
+      getOperationStatus: vi.fn().mockRejectedValue(new Error(`Operation not found: ${validOperationId}`)),
+    });
 
-    const controller = moduleRef.get(OperationsController);
-    await expect(controller.getOperation('missing')).rejects.toBeInstanceOf(NotFoundException);
+    await request(app.getHttpServer())
+      .get(`/v1/operations/${validOperationId}`)
+      .expect(404);
   });
 
-  it('maps unexpected service errors to bad request responses', async () => {
-    const operations = {
-      createUnderstanding: vi.fn(),
+  it('maps unexpected service errors to internal server errors', async () => {
+    const { app } = await createApp({
       submitUnderstanding: vi.fn().mockRejectedValue(new Error('unexpected')),
-    };
-    const moduleRef = await Test.createTestingModule({
-      controllers: [OperationsController],
-      providers: [
-        { provide: APP_CONFIG, useValue: config },
-        { provide: RemoteOperationService, useValue: operations },
-      ],
-    }).compile();
+    });
 
-    const controller = moduleRef.get(OperationsController);
-    await expect(
-      controller.createUnderstanding({
+    await request(app.getHttpServer())
+      .post('/v1/understanding')
+      .send({
         source: { kind: 'http', uri: 'https://example.com/video.mp4' },
-      }),
-    ).rejects.toBeInstanceOf(BadRequestException);
+        provider: 'google-gemini',
+        prompt: 'Describe this video.',
+      })
+      .expect(500);
   });
 });

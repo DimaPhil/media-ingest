@@ -1,23 +1,75 @@
 import { z } from 'zod';
 
-import { operationKinds, providerIds, sourceKinds } from './types';
+import { operationKinds, providerIds } from './types';
+import {
+  validateGoogleDriveSourceUri,
+  validateHttpSourceUri,
+  validateTelegramSourceUri,
+  validateYoutubeSourceUri,
+  validateYtDlpSourceUri,
+} from './source-validation';
 
-const baseSourceSchema = z.object({
-  kind: z.enum(sourceKinds),
+function buildSourceUriSchema(validate: (uri: string) => string) {
+  return z.string().trim().min(1).superRefine((value, context) => {
+    try {
+      validate(value);
+    } catch (error) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: error instanceof Error ? error.message : 'Invalid source URI',
+      });
+    }
+  });
+}
+
+const youtubeSourceSchema = z.object({
+  kind: z.literal('youtube'),
+  uri: buildSourceUriSchema(validateYoutubeSourceUri),
+});
+
+const ytDlpSourceSchema = z.object({
+  kind: z.literal('yt_dlp'),
+  uri: buildSourceUriSchema(validateYtDlpSourceUri),
+});
+
+const googleDriveSourceSchema = z.object({
+  kind: z.literal('google_drive'),
+  uri: buildSourceUriSchema(validateGoogleDriveSourceUri),
+});
+
+const telegramSourceSchema = z.object({
+  kind: z.literal('telegram'),
+  uri: buildSourceUriSchema(validateTelegramSourceUri),
+});
+
+const httpSourceSchema = z.object({
+  kind: z.literal('http'),
+  uri: buildSourceUriSchema(validateHttpSourceUri),
+});
+
+const localFileSourceSchema = z.object({
+  kind: z.literal('local_file'),
   uri: z.string().trim().min(1),
 });
 
-export const remoteSourceSchema = baseSourceSchema.refine(
-  (value) => value.kind !== 'local_file',
-  {
-    message: 'local_file is only supported in CLI local mode',
-    path: ['kind'],
-  },
-);
+export const baseSourceSchema = z.discriminatedUnion('kind', [
+  youtubeSourceSchema,
+  ytDlpSourceSchema,
+  googleDriveSourceSchema,
+  telegramSourceSchema,
+  httpSourceSchema,
+  localFileSourceSchema,
+]);
 
-export const localSourceSchema = baseSourceSchema.extend({
-  kind: z.literal('local_file'),
-});
+export const remoteSourceSchema = z.discriminatedUnion('kind', [
+  youtubeSourceSchema,
+  ytDlpSourceSchema,
+  googleDriveSourceSchema,
+  telegramSourceSchema,
+  httpSourceSchema,
+]);
+
+export const localSourceSchema = localFileSourceSchema;
 
 const transcriptionProviderSchema = z.enum([
   providerIds[0],
@@ -63,6 +115,7 @@ export const operationRequestSchema = z.discriminatedUnion('kind', [
   }),
 ]);
 
+export type OperationRequest = z.infer<typeof operationRequestSchema>;
 export type MediaSourceInput = z.infer<typeof baseSourceSchema>;
 export type RemoteMediaSourceInput = z.infer<typeof remoteSourceSchema>;
 export type LocalMediaSourceInput = z.infer<typeof localSourceSchema>;

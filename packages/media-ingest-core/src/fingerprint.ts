@@ -1,16 +1,20 @@
 import { createHash } from 'node:crypto';
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
 function stableSort(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map(stableSort);
   }
-  if (!value || typeof value !== 'object') {
+  if (!isRecord(value)) {
     return value;
   }
-  return Object.keys(value as Record<string, unknown>)
+  return Object.keys(value)
     .sort()
     .reduce<Record<string, unknown>>((accumulator, key) => {
-      accumulator[key] = stableSort((value as Record<string, unknown>)[key]);
+      accumulator[key] = stableSort(value[key]);
       return accumulator;
     }, {});
 }
