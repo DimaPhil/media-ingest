@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNotNull, lte, sql } from 'drizzle-orm';
 import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import {
   boolean,
@@ -480,9 +480,7 @@ export class OperationsRepository {
     const rows = await this.database.db
       .select()
       .from(operationsTable)
-      .where(
-        and(sql`${operationsTable.expiresAt} IS NOT NULL`, sql`${operationsTable.expiresAt} <= ${now}`),
-      );
+      .where(and(isNotNull(operationsTable.expiresAt), lte(operationsTable.expiresAt, now)));
     if (rows.length === 0) {
       return [];
     }
