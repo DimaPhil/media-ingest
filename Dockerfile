@@ -14,7 +14,7 @@ COPY packages ./packages
 COPY config ./config
 
 RUN pnpm install --frozen-lockfile
-RUN pnpm build
+RUN find . -name '*.tsbuildinfo' -delete && pnpm build
 
 ENV NODE_ENV=production
 ENV MEDIA_INGEST_CONFIG_PATH=/app/config/app.yaml
