@@ -1,11 +1,11 @@
+.git
+.gitignore
 node_modules
-dist
 coverage
-.DS_Store
+dist
 .env
 config/app.yaml
 .tmp
 tmp
 *.log
-.pnpm-store
 *.tsbuildinfo

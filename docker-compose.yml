@@ -9,7 +9,7 @@ services:
     ports:
       - '4000:4000'
     volumes:
-      - ./config/app.example.yaml:/app/config/app.yaml:ro
+      - ./config/app.yaml:/app/config/app.yaml:ro
       - ${MEDIA_INGEST_FIREFOX_DIR}:/root/.mozilla/firefox:ro
       - media-ingest-tmp:/app/.tmp
 
