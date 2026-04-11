@@ -4,7 +4,7 @@ WORKDIR /app
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip ca-certificates \
-  && python3 -m pip install --break-system-packages yt-dlp \
+  && python3 -m pip install --break-system-packages yt-dlp yt-dlp-ejs \
   && npm install -g pnpm@10.6.1 \
   && rm -rf /var/lib/apt/lists/*
 

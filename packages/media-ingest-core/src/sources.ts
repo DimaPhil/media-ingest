@@ -185,6 +185,10 @@ class YtDlpSourceResolver implements SourceResolver {
       : [];
   }
 
+  private runtimeArgs(): string[] {
+    return ['--js-runtimes', 'node'];
+  }
+
   private hasCookieConfiguration(): boolean {
     return Boolean(
       this.config.storage.ytDlpCookiesFromBrowser || this.config.storage.ytDlpCookiesPath,
@@ -199,13 +203,28 @@ class YtDlpSourceResolver implements SourceResolver {
       || (/cookie file/i.test(text) && /does not exist/i.test(text));
   }
 
+  private isCookieChallengeFailure(error: unknown): boolean {
+    const details = isRecord(error) ? error : undefined;
+    const text = `${details?.message ?? ''}\n${details?.stderr ?? ''}`;
+    return /n challenge solving failed/i.test(text)
+      || /signature solving failed/i.test(text)
+      || /only images are available for download/i.test(text)
+      || /requested format is not available/i.test(text)
+      || /no supported javascript runtime could be found/i.test(text);
+  }
+
   private async execYtDlp(args: string[]): Promise<{ stdout: string; stderr: string }> {
+    const baseArgs = [...this.runtimeArgs(), ...args];
     const cookieArgs = this.cookiesArgs();
     try {
-      return await execFile(this.config.sources.ytDlp.binaryPath, [...args, ...cookieArgs]);
+      return await execFile(this.config.sources.ytDlp.binaryPath, [...baseArgs, ...cookieArgs]);
     } catch (error) {
-      if (cookieArgs.length > 0 && this.hasCookieConfiguration() && this.isCookieLookupFailure(error)) {
-        return execFile(this.config.sources.ytDlp.binaryPath, args);
+      if (
+        cookieArgs.length > 0
+        && this.hasCookieConfiguration()
+        && (this.isCookieLookupFailure(error) || this.isCookieChallengeFailure(error))
+      ) {
+        return execFile(this.config.sources.ytDlp.binaryPath, baseArgs);
       }
       throw error;
     }
