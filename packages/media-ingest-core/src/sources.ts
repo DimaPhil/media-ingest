@@ -13,6 +13,7 @@ import type { MediaSourceInput } from './contracts';
 import { parseGoogleDriveFileId, parseTelegramUri } from './source-validation';
 
 const execFile = promisify(execFileCb);
+const YT_DLP_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 
 export interface ResolvedSource {
   kind: MediaSourceInput['kind'];
@@ -186,7 +187,7 @@ class YtDlpSourceResolver implements SourceResolver {
   }
 
   private runtimeArgs(): string[] {
-    return ['--js-runtimes', 'node'];
+    return ['--js-runtimes', 'node', '--remote-components', 'ejs:github'];
   }
 
   private hasCookieConfiguration(): boolean {
@@ -217,14 +218,18 @@ class YtDlpSourceResolver implements SourceResolver {
     const baseArgs = [...this.runtimeArgs(), ...args];
     const cookieArgs = this.cookiesArgs();
     try {
-      return await execFile(this.config.sources.ytDlp.binaryPath, [...baseArgs, ...cookieArgs]);
+      return await execFile(this.config.sources.ytDlp.binaryPath, [...baseArgs, ...cookieArgs], {
+        maxBuffer: YT_DLP_MAX_BUFFER_BYTES,
+      });
     } catch (error) {
       if (
         cookieArgs.length > 0
         && this.hasCookieConfiguration()
         && (this.isCookieLookupFailure(error) || this.isCookieChallengeFailure(error))
       ) {
-        return execFile(this.config.sources.ytDlp.binaryPath, baseArgs);
+        return execFile(this.config.sources.ytDlp.binaryPath, baseArgs, {
+          maxBuffer: YT_DLP_MAX_BUFFER_BYTES,
+        });
       }
       throw error;
     }
