@@ -1,6 +1,7 @@
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { AsyncLimiter, mapConcurrent } from '../async';
 import type { AppConfig } from '../config';
 import {
   createAudioChunk,
@@ -31,11 +32,21 @@ import {
 } from './shared';
 
 export class PipelineRunner {
+  private readonly sourceLimiter: AsyncLimiter;
+
+  private readonly ffmpegLimiter: AsyncLimiter;
+
+  private readonly providerLimiter: AsyncLimiter;
+
   public constructor(
     private readonly config: AppConfig,
     private readonly sources: SourceRegistry,
     private readonly providers: ProviderRegistry,
-  ) {}
+  ) {
+    this.sourceLimiter = new AsyncLimiter(config.concurrency.sourceResolvers);
+    this.ffmpegLimiter = new AsyncLimiter(config.concurrency.ffmpegJobs);
+    this.providerLimiter = new AsyncLimiter(config.concurrency.providerRequests);
+  }
 
   public async execute(store: StepStore): Promise<OperationResult> {
     const context: PipelineContext = {};
@@ -134,7 +145,7 @@ export class PipelineRunner {
     switch (stepName) {
       case 'resolve_source': {
         const resolver = this.sources.resolverFor(store.request.source);
-        const resolvedSource = await resolver.resolve(store.request.source);
+        const resolvedSource = await this.sourceLimiter.run(() => resolver.resolve(store.request.source));
         return { resolvedSource };
       }
       case 'inspect_media': {
@@ -153,16 +164,19 @@ export class PipelineRunner {
         };
       }
       case 'materialize_media': {
-        if (!context.resolvedSource) {
+        const resolvedSource = context.resolvedSource;
+        if (!resolvedSource) {
           throw new Error('Source must be resolved before materialize_media');
         }
         const resolver = this.sources.resolverFor(store.request.source);
         const destinationDirectory = join(store.workingDirectory, 'source');
         await mkdir(destinationDirectory, { recursive: true });
-        const materialized = await resolver.materialize(
-          context.resolvedSource,
-          destinationDirectory,
-          store.kind,
+        const materialized = await this.sourceLimiter.run(() =>
+          resolver.materialize(
+            resolvedSource,
+            destinationDirectory,
+            store.kind,
+          )
         );
         return { materialized };
       }
@@ -184,30 +198,37 @@ export class PipelineRunner {
         }
         if (isTranscriptionStore(store)) {
           const provider = this.providers.transcriptionProvider(store.request.provider);
-          const chunkTranscripts: ChunkTranscript[] = [];
-          for (const chunk of context.plannedChunks) {
-            const chunkPath = defaultChunkPath(
-              store.workingDirectory,
-              store.operationId,
-              chunk.index,
-              'mp3',
-            );
-            await createAudioChunk(context.materialized.localPath, chunk, chunkPath);
-            const result = await provider.transcribeChunk({
-              filePath: chunkPath,
-              ...(store.request.inputLanguage ? { inputLanguage: store.request.inputLanguage } : {}),
-              ...(store.request.model ? { model: store.request.model } : {}),
-            });
-            chunkTranscripts.push({
-              index: chunk.index,
-              startMs: chunk.startMs,
-              endMs: chunk.endMs,
-              text: result.text,
-              detectedLanguage: result.detectedLanguage,
-              segments: result.segments,
-              raw: result.raw,
-            });
-          }
+          const chunkTranscripts = await mapConcurrent(
+            context.plannedChunks,
+            this.config.concurrency.chunkTasksPerOperation,
+            async (chunk) => {
+              const chunkPath = defaultChunkPath(
+                store.workingDirectory,
+                store.operationId,
+                chunk.index,
+                'mp3',
+              );
+              await this.ffmpegLimiter.run(() =>
+                createAudioChunk(context.materialized!.localPath, chunk, chunkPath)
+              );
+              const result = await this.providerLimiter.run(() =>
+                provider.transcribeChunk({
+                  filePath: chunkPath,
+                  ...(store.request.inputLanguage ? { inputLanguage: store.request.inputLanguage } : {}),
+                  ...(store.request.model ? { model: store.request.model } : {}),
+                })
+              );
+              return {
+                index: chunk.index,
+                startMs: chunk.startMs,
+                endMs: chunk.endMs,
+                text: result.text,
+                detectedLanguage: result.detectedLanguage,
+                segments: result.segments,
+                raw: result.raw,
+              } satisfies ChunkTranscript;
+            },
+          );
           return { chunkTranscripts };
         }
 
@@ -215,29 +236,36 @@ export class PipelineRunner {
           throw new Error('Understanding step received a non-understanding request');
         }
         const provider = this.providers.understandingProvider(store.request.provider);
-        const chunkUnderstanding: ChunkUnderstanding[] = [];
-        for (const chunk of context.plannedChunks) {
-          const chunkPath = defaultChunkPath(
-            store.workingDirectory,
-            store.operationId,
-            chunk.index,
-            'mp4',
-          );
-          await createVideoChunk(context.materialized.localPath, chunk, chunkPath);
-          const result = await provider.understandChunk({
-            filePath: chunkPath,
-            ...(store.request.model ? { model: store.request.model } : {}),
-            prompt: store.request.prompt,
-          });
-          chunkUnderstanding.push({
-            index: chunk.index,
-            startMs: chunk.startMs,
-            endMs: chunk.endMs,
-            responseText: result.responseText,
-            timeRanges: result.timeRanges,
-            raw: result.raw,
-          });
-        }
+        const chunkUnderstanding = await mapConcurrent(
+          context.plannedChunks,
+          this.config.concurrency.chunkTasksPerOperation,
+          async (chunk) => {
+            const chunkPath = defaultChunkPath(
+              store.workingDirectory,
+              store.operationId,
+              chunk.index,
+              'mp4',
+            );
+            await this.ffmpegLimiter.run(() =>
+              createVideoChunk(context.materialized!.localPath, chunk, chunkPath)
+            );
+            const result = await this.providerLimiter.run(() =>
+              provider.understandChunk({
+                filePath: chunkPath,
+                ...(store.request.model ? { model: store.request.model } : {}),
+                prompt: store.request.prompt,
+              })
+            );
+            return {
+              index: chunk.index,
+              startMs: chunk.startMs,
+              endMs: chunk.endMs,
+              responseText: result.responseText,
+              timeRanges: result.timeRanges,
+              raw: result.raw,
+            } satisfies ChunkUnderstanding;
+          },
+        );
         return { chunkUnderstanding };
       }
       case 'merge_chunks': {

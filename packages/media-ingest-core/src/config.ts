@@ -39,6 +39,13 @@ const configSchema = z.object({
   features: z.object({
     cacheEnabled: z.boolean().default(true),
   }),
+  concurrency: z.object({
+    operations: z.number().int().positive().default(2),
+    sourceResolvers: z.number().int().positive().default(2),
+    ffmpegJobs: z.number().int().positive().default(2),
+    providerRequests: z.number().int().positive().default(4),
+    chunkTasksPerOperation: z.number().int().positive().default(2),
+  }),
   storage: z.object({
     workingDirectory: z.string().default('./.tmp/media-ingest'),
     completedRetentionHours: z.number().positive().default(24),
@@ -188,6 +195,31 @@ function envOverrides(env: NodeJS.ProcessEnv): Record<string, unknown> {
     };
   }
   if (
+    env.MEDIA_INGEST_OPERATIONS_CONCURRENCY
+    || env.MEDIA_INGEST_SOURCE_RESOLVER_CONCURRENCY
+    || env.MEDIA_INGEST_FFMPEG_CONCURRENCY
+    || env.MEDIA_INGEST_PROVIDER_REQUEST_CONCURRENCY
+    || env.MEDIA_INGEST_CHUNK_TASKS_PER_OPERATION
+  ) {
+    overrides.concurrency = {
+      operations: env.MEDIA_INGEST_OPERATIONS_CONCURRENCY
+        ? Number(env.MEDIA_INGEST_OPERATIONS_CONCURRENCY)
+        : undefined,
+      sourceResolvers: env.MEDIA_INGEST_SOURCE_RESOLVER_CONCURRENCY
+        ? Number(env.MEDIA_INGEST_SOURCE_RESOLVER_CONCURRENCY)
+        : undefined,
+      ffmpegJobs: env.MEDIA_INGEST_FFMPEG_CONCURRENCY
+        ? Number(env.MEDIA_INGEST_FFMPEG_CONCURRENCY)
+        : undefined,
+      providerRequests: env.MEDIA_INGEST_PROVIDER_REQUEST_CONCURRENCY
+        ? Number(env.MEDIA_INGEST_PROVIDER_REQUEST_CONCURRENCY)
+        : undefined,
+      chunkTasksPerOperation: env.MEDIA_INGEST_CHUNK_TASKS_PER_OPERATION
+        ? Number(env.MEDIA_INGEST_CHUNK_TASKS_PER_OPERATION)
+        : undefined,
+    };
+  }
+  if (
     env.MEDIA_INGEST_WORKDIR ||
     env.YT_DLP_COOKIES_FROM_BROWSER ||
     env.YT_DLP_COOKIES_PATH
@@ -231,6 +263,13 @@ export function loadAppConfig(options: LoadConfigOptions = {}): AppConfig {
     },
     features: {
       cacheEnabled: true,
+    },
+    concurrency: {
+      operations: 2,
+      sourceResolvers: 2,
+      ffmpegJobs: 2,
+      providerRequests: 4,
+      chunkTasksPerOperation: 2,
     },
     storage: {
       workingDirectory: './.tmp/media-ingest',

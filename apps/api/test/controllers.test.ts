@@ -19,6 +19,13 @@ import { ZodValidationPipe } from '../src/zod-validation.pipe';
 const config: AppConfig = {
   app: { env: 'test', host: '127.0.0.1', port: 4000, pollAfterMs: 10 },
   features: { cacheEnabled: true },
+  concurrency: {
+    operations: 2,
+    sourceResolvers: 2,
+    ffmpegJobs: 2,
+    providerRequests: 4,
+    chunkTasksPerOperation: 2,
+  },
   storage: {
     workingDirectory: '/tmp',
     completedRetentionHours: 24,

@@ -90,6 +90,13 @@ function createConfig(): AppConfig {
     features: {
       cacheEnabled: true,
     },
+    concurrency: {
+      operations: 2,
+      sourceResolvers: 2,
+      ffmpegJobs: 2,
+      providerRequests: 4,
+      chunkTasksPerOperation: 2,
+    },
     storage: {
       workingDirectory: '/tmp',
       completedRetentionHours: 24,

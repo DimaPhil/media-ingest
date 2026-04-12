@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 
+import { AsyncLimiter } from '../async';
 import type {
   RemoteTranscriptionRequest,
   RemoteUnderstandingRequest,
@@ -112,6 +113,9 @@ function mapOperationListItem(operation: PersistedOperation): OperationListItemV
 
 export class RemoteOperationService {
   private readonly runner: PipelineRunner;
+
+  private readonly operationLimiter: AsyncLimiter;
+
   private readonly inFlight = new Map<string, Promise<void>>();
 
   public constructor(
@@ -121,6 +125,7 @@ export class RemoteOperationService {
     private readonly providers: ProviderRegistry,
   ) {
     this.runner = new PipelineRunner(config, sources, providers);
+    this.operationLimiter = new AsyncLimiter(config.concurrency.operations);
   }
 
   public async initialize(): Promise<void> {
@@ -316,7 +321,7 @@ export class RemoteOperationService {
     }
     const promise = (async () => {
       try {
-        await this.processOperation(operationId);
+        await this.operationLimiter.run(() => this.processOperation(operationId));
       } catch {
         // Errors are already persisted in operation state.
       } finally {

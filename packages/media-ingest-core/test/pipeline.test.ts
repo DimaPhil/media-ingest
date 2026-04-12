@@ -198,6 +198,13 @@ function createConfig(): AppConfig {
     features: {
       cacheEnabled: true,
     },
+    concurrency: {
+      operations: 2,
+      sourceResolvers: 2,
+      ffmpegJobs: 2,
+      providerRequests: 4,
+      chunkTasksPerOperation: 2,
+    },
     storage: {
       workingDirectory: join(tmpdir(), 'media-ingest-tests'),
       completedRetentionHours: 1,
@@ -396,6 +403,80 @@ describe('RemoteOperationService', () => {
       kind: 'transcription',
       sourceTranscript: 'slow result',
     });
+  });
+
+  it('runs chunk transcription with bounded parallelism', async () => {
+    const fixturePath = await createAudioFixture(3);
+    createdFiles.push(fixturePath);
+    const repository = new InMemoryRepository();
+    const config = createConfig();
+    config.concurrency.chunkTasksPerOperation = 2;
+    config.concurrency.providerRequests = 4;
+    config.concurrency.ffmpegJobs = 2;
+
+    let activeProviderCalls = 0;
+    let maxProviderCalls = 0;
+
+    const service = new RemoteOperationService(
+      config,
+      repository as never,
+      {
+        resolverFor: () => ({
+          resolve: async () => ({
+            kind: 'http',
+            canonicalUri: 'https://example.com/audio.mp3',
+            displayName: 'Example',
+            fileName: 'audio.mp3',
+            metadata: {},
+          }),
+          materialize: async () => ({
+            localPath: fixturePath,
+            fileName: 'audio.mp3',
+          }),
+        }),
+      } as never,
+      {
+        transcriptionProvider: () => ({
+          resolveModel: () => 'parallel-model',
+          capability: () => ({
+            maxWholeFileDurationMs: 400,
+            chunkDurationMs: 400,
+            overlapMs: 0,
+          }),
+          transcribeChunk: async ({ filePath }: { filePath: string }) => {
+            expect(filePath).toContain('chunk-');
+            activeProviderCalls += 1;
+            maxProviderCalls = Math.max(maxProviderCalls, activeProviderCalls);
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            activeProviderCalls -= 1;
+            return {
+              text: 'parallel-result',
+              detectedLanguage: 'en',
+              segments: [{ startMs: 0, endMs: 200, text: 'parallel-result' }],
+            };
+          },
+        }),
+        translateWithBestAvailable: async () => '',
+      } as never,
+    );
+
+    await service.initialize();
+    const submitted = await service.submitTranscription({
+      source: { kind: 'http', uri: 'https://example.com/audio.mp3' },
+      provider: 'openai',
+      force: true,
+    });
+
+    const completed = await waitFor(
+      () => service.getOperationStatus(submitted.operationId),
+      (value) => value.operation.status === 'completed',
+    );
+
+    expect(completed.result).toMatchObject({
+      kind: 'transcription',
+    });
+    expect(maxProviderCalls).toBeGreaterThan(1);
+    expect(maxProviderCalls).toBeLessThanOrEqual(2);
   });
 
   it('resumes a failed operation from the same operation id when retried', async () => {

@@ -1,19 +1,15 @@
 import { createWriteStream } from 'node:fs';
 import { access, copyFile, mkdir } from 'node:fs/promises';
-import { basename, dirname, extname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { promisify } from 'node:util';
-import { execFile as execFileCb } from 'node:child_process';
 
 import { google } from 'googleapis';
 
 import type { AppConfig } from './config';
 import type { MediaSourceInput } from './contracts';
 import { parseGoogleDriveFileId, parseTelegramUri } from './source-validation';
-
-const execFile = promisify(execFileCb);
-const YT_DLP_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
+import { YtDlpClient } from './yt-dlp';
 
 export interface ResolvedSource {
   kind: MediaSourceInput['kind'];
@@ -52,10 +48,6 @@ async function downloadToFile(
   }
   await mkdir(dirname(destinationPath), { recursive: true });
   await pipeline(Readable.fromWeb(response.body), createWriteStream(destinationPath));
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
 function isReadableNodeStream(value: unknown): value is NodeJS.ReadableStream {
@@ -171,90 +163,24 @@ class HttpSourceResolver implements SourceResolver {
 }
 
 class YtDlpSourceResolver implements SourceResolver {
-  public constructor(private readonly config: AppConfig) {}
+  private readonly client: YtDlpClient;
+
+  public constructor(private readonly config: AppConfig) {
+    this.client = new YtDlpClient(config);
+  }
 
   public supports(source: MediaSourceInput): boolean {
     return source.kind === 'youtube' || source.kind === 'yt_dlp';
   }
 
-  private cookiesArgs(): string[] {
-    if (this.config.storage.ytDlpCookiesFromBrowser) {
-      return ['--cookies-from-browser', this.config.storage.ytDlpCookiesFromBrowser];
-    }
-    return this.config.storage.ytDlpCookiesPath
-      ? ['--cookies', this.config.storage.ytDlpCookiesPath]
-      : [];
-  }
-
-  private runtimeArgs(): string[] {
-    return ['--js-runtimes', 'node', '--remote-components', 'ejs:github'];
-  }
-
-  private hasCookieConfiguration(): boolean {
-    return Boolean(
-      this.config.storage.ytDlpCookiesFromBrowser || this.config.storage.ytDlpCookiesPath,
-    );
-  }
-
-  private isCookieLookupFailure(error: unknown): boolean {
-    const details = isRecord(error) ? error : undefined;
-    const text = `${details?.message ?? ''}\n${details?.stderr ?? ''}`;
-    return /could not find .*cookies database/i.test(text)
-      || (/FileNotFoundError/i.test(text) && /cookies/i.test(text))
-      || (/cookie file/i.test(text) && /does not exist/i.test(text));
-  }
-
-  private isCookieChallengeFailure(error: unknown): boolean {
-    const details = isRecord(error) ? error : undefined;
-    const text = `${details?.message ?? ''}\n${details?.stderr ?? ''}`;
-    return /n challenge solving failed/i.test(text)
-      || /signature solving failed/i.test(text)
-      || /only images are available for download/i.test(text)
-      || /requested format is not available/i.test(text)
-      || /no supported javascript runtime could be found/i.test(text);
-  }
-
-  private async execYtDlp(args: string[]): Promise<{ stdout: string; stderr: string }> {
-    const baseArgs = [...this.runtimeArgs(), ...args];
-    const cookieArgs = this.cookiesArgs();
-    try {
-      return await execFile(this.config.sources.ytDlp.binaryPath, [...baseArgs, ...cookieArgs], {
-        maxBuffer: YT_DLP_MAX_BUFFER_BYTES,
-      });
-    } catch (error) {
-      if (
-        cookieArgs.length > 0
-        && this.hasCookieConfiguration()
-        && (this.isCookieLookupFailure(error) || this.isCookieChallengeFailure(error))
-      ) {
-        return execFile(this.config.sources.ytDlp.binaryPath, baseArgs, {
-          maxBuffer: YT_DLP_MAX_BUFFER_BYTES,
-        });
-      }
-      throw error;
-    }
-  }
-
   public async resolve(source: MediaSourceInput): Promise<ResolvedSource> {
-    const { stdout } = await this.execYtDlp([
-      '--dump-single-json',
-      '--no-playlist',
-      source.uri,
-    ]);
-    const parsed = JSON.parse(stdout);
-    if (!isRecord(parsed)) {
-      throw new Error('yt-dlp returned an unexpected metadata payload');
-    }
-    const metadata = parsed;
-    if (metadata.entries) {
-      throw new Error('Playlists are not supported in v1');
-    }
+    const metadata = await this.client.resolve(source.uri);
     return {
       kind: source.kind,
-      canonicalUri: String(metadata.webpage_url ?? source.uri),
-      displayName: String(metadata.title ?? source.uri),
-      fileName: safeFileName(String(metadata.title ?? 'media')) + extname(String(metadata._filename ?? '.mp4')),
-      metadata,
+      canonicalUri: metadata.canonicalUri,
+      displayName: metadata.displayName,
+      fileName: metadata.fileName,
+      metadata: metadata.metadata,
     };
   }
 
@@ -265,22 +191,10 @@ class YtDlpSourceResolver implements SourceResolver {
   ): Promise<MaterializedSource> {
     await mkdir(destinationDirectory, { recursive: true });
     const template = join(destinationDirectory, '%(title)s.%(ext)s');
-    const format = operationKind === 'transcription' ? 'bestaudio/best' : 'bestvideo*+bestaudio/best';
-    await this.execYtDlp([
-      '--no-playlist',
-      '--format',
-      format,
-      '--output',
-      template,
-      source.canonicalUri,
-    ]);
-    const files = await execFile('bash', ['-lc', `ls -1 ${JSON.stringify(destinationDirectory)} | head -n 1`]);
-    const fileName = files.stdout.trim();
-    if (!fileName) {
-      throw new Error('yt-dlp completed without creating a file');
-    }
+    const localPath = await this.client.download(source.canonicalUri, template, operationKind);
+    const fileName = basename(localPath);
     return {
-      localPath: join(destinationDirectory, fileName),
+      localPath,
       fileName,
     };
   }
