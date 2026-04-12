@@ -68,6 +68,8 @@ async function waitFor<T>(producer: () => Promise<T>, predicate: (value: T) => b
 class InMemoryRepository {
   public readonly operations = new Map<string, any>();
   public readonly steps = new Map<string, Map<OperationStepName, any>>();
+  public readonly mediaResources = new Map<string, any>();
+  public readonly durableResults = new Map<string, any>();
   private nextId = 1;
 
   public async initialize(): Promise<void> {}
@@ -82,22 +84,52 @@ class InMemoryRepository {
     const operation = {
       id,
       ...input,
-      status: 'queued',
-      result: null,
-      error: null,
-      cacheHit: false,
-      retryable: true,
-      currentStep: null,
+      status: input.status ?? 'queued',
+      mediaResourceId: input.mediaResourceId ?? null,
+      resultCacheKey: input.resultCacheKey ?? null,
+      durableResultId: input.durableResultId ?? null,
+      result: input.result ?? null,
+      error: input.error ?? null,
+      cacheHit: input.cacheHit ?? false,
+      retryable: input.retryable ?? true,
+      currentStep: input.currentStep ?? null,
       createdAt: now,
       updatedAt: now,
-      startedAt: null,
-      completedAt: null,
-      expiresAt: null,
-      lastHeartbeatAt: null,
+      startedAt: input.startedAt ?? null,
+      completedAt: input.completedAt ?? null,
+      expiresAt: input.expiresAt ?? null,
+      lastHeartbeatAt: input.lastHeartbeatAt ?? null,
     };
     this.operations.set(id, operation);
     this.steps.set(id, new Map());
     return operation;
+  }
+
+  public async upsertMediaResource(input: any): Promise<any> {
+    const existing = Array.from(this.mediaResources.values()).find(
+      (resource) => resource.resourceKey === input.resourceKey,
+    );
+    const now = new Date();
+    if (existing) {
+      const updated = {
+        ...existing,
+        ...input,
+        mimeType: input.mimeType ?? null,
+        updatedAt: now,
+      };
+      this.mediaResources.set(existing.id, updated);
+      return updated;
+    }
+
+    const resource = {
+      id: `media-${this.nextId++}`,
+      ...input,
+      mimeType: input.mimeType ?? null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.mediaResources.set(resource.id, resource);
+    return resource;
   }
 
   public async updateOperation(id: string, patch: any): Promise<any> {
@@ -128,6 +160,39 @@ class InMemoryRepository {
     return Array.from(this.operations.values()).filter((operation) =>
       ['queued', 'running', 'failed'].includes(operation.status),
     );
+  }
+
+  public async findReadyDurableResultByCacheKey(cacheKey: string): Promise<any> {
+    return (
+      Array.from(this.durableResults.values())
+        .filter((result) => result.cacheKey === cacheKey && result.status === 'ready')
+        .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())[0] ?? null
+    );
+  }
+
+  public async saveDurableResult(input: any): Promise<any> {
+    const now = new Date();
+    for (const [id, result] of this.durableResults.entries()) {
+      if (result.cacheKey === input.cacheKey && result.status === 'ready') {
+        this.durableResults.set(id, {
+          ...result,
+          status: 'superseded',
+          supersededAt: now,
+          updatedAt: now,
+        });
+      }
+    }
+
+    const durableResult = {
+      id: `result-${this.nextId++}`,
+      ...input,
+      status: 'ready',
+      supersededAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.durableResults.set(durableResult.id, durableResult);
+    return durableResult;
   }
 
   public async listSteps(operationId: string): Promise<any[]> {
@@ -337,6 +402,81 @@ describe('RemoteOperationService', () => {
     expect(second.operationId).toBe(first.operationId);
   });
 
+  it('reuses a durable transcription result after the original operation is cleaned up', async () => {
+    const fixturePath = await createAudioFixture();
+    createdFiles.push(fixturePath);
+    const repository = new InMemoryRepository();
+    const service = new RemoteOperationService(
+      createConfig(),
+      repository as never,
+      {
+        resolverFor: () => ({
+          resolve: async () => ({
+            kind: 'http',
+            canonicalUri: 'https://example.com/audio.mp3',
+            displayName: 'Example',
+            fileName: 'audio.mp3',
+            metadata: {},
+          }),
+          materialize: async () => ({
+            localPath: fixturePath,
+            fileName: 'audio.mp3',
+          }),
+        }),
+      } as never,
+      {
+        transcriptionProvider: () => ({
+          resolveModel: () => 'fake-model',
+          capability: () => ({
+            maxWholeFileDurationMs: 60_000,
+            chunkDurationMs: 60_000,
+            overlapMs: 0,
+          }),
+          transcribeChunk: async () => ({
+            text: 'durable transcript',
+            detectedLanguage: 'en',
+            segments: [{ startMs: 0, endMs: 500, text: 'durable transcript' }],
+          }),
+        }),
+        translateWithBestAvailable: async () => '',
+      } as never,
+    );
+
+    await service.initialize();
+    const first = await service.submitTranscription({
+      source: { kind: 'http', uri: 'https://example.com/audio.mp3' },
+      provider: 'openai',
+      force: false,
+    });
+
+    await waitFor(
+      () => service.getOperationStatus(first.operationId),
+      (value) => value.operation.status === 'completed',
+    );
+
+    await repository.updateOperation(first.operationId, {
+      expiresAt: new Date(Date.now() - 1_000),
+    });
+    await service.cleanupExpiredOperations();
+
+    const second = await service.submitTranscription({
+      source: { kind: 'http', uri: 'https://example.com/audio.mp3' },
+      provider: 'openai',
+      force: false,
+    });
+
+    expect(second.cacheHit).toBe(true);
+    expect(second.operationId).not.toBe(first.operationId);
+
+    const cached = await service.getOperationStatus(second.operationId);
+    expect(cached.operation.status).toBe('completed');
+    expect(cached.cacheHit).toBe(true);
+    expect(cached.result).toMatchObject({
+      kind: 'transcription',
+      sourceTranscript: 'durable transcript',
+    });
+  });
+
   it('reuses an in-flight operation instead of creating a duplicate', async () => {
     const fixturePath = await createAudioFixture();
     createdFiles.push(fixturePath);
@@ -479,6 +619,89 @@ describe('RemoteOperationService', () => {
     expect(maxProviderCalls).toBeLessThanOrEqual(2);
   });
 
+  it('force regeneration creates a fresh operation and supersedes the previous durable result', async () => {
+    const fixturePath = await createAudioFixture();
+    createdFiles.push(fixturePath);
+    const repository = new InMemoryRepository();
+    let revision = 0;
+    const service = new RemoteOperationService(
+      createConfig(),
+      repository as never,
+      {
+        resolverFor: () => ({
+          resolve: async () => ({
+            kind: 'http',
+            canonicalUri: 'https://example.com/audio.mp3',
+            displayName: 'Example',
+            fileName: 'audio.mp3',
+            metadata: {},
+          }),
+          materialize: async () => ({
+            localPath: fixturePath,
+            fileName: 'audio.mp3',
+          }),
+        }),
+      } as never,
+      {
+        transcriptionProvider: () => ({
+          resolveModel: () => 'fake-model',
+          capability: () => ({
+            maxWholeFileDurationMs: 60_000,
+            chunkDurationMs: 60_000,
+            overlapMs: 0,
+          }),
+          transcribeChunk: async () => {
+            revision += 1;
+            return {
+              text: `version-${revision}`,
+              detectedLanguage: 'en',
+              segments: [{ startMs: 0, endMs: 500, text: `version-${revision}` }],
+            };
+          },
+        }),
+        translateWithBestAvailable: async () => '',
+      } as never,
+    );
+
+    await service.initialize();
+    const first = await service.submitTranscription({
+      source: { kind: 'http', uri: 'https://example.com/audio.mp3' },
+      provider: 'openai',
+      force: false,
+    });
+    const firstStatus = await waitFor(
+      () => service.getOperationStatus(first.operationId),
+      (value) => value.operation.status === 'completed',
+    );
+    expect(firstStatus.result).toMatchObject({
+      sourceTranscript: 'version-1',
+    });
+
+    const second = await service.submitTranscription({
+      source: { kind: 'http', uri: 'https://example.com/audio.mp3' },
+      provider: 'openai',
+      force: true,
+    });
+    expect(second.cacheHit).toBe(false);
+    expect(second.operationId).not.toBe(first.operationId);
+
+    const secondStatus = await waitFor(
+      () => service.getOperationStatus(second.operationId),
+      (value) => value.operation.status === 'completed',
+    );
+    expect(secondStatus.result).toMatchObject({
+      sourceTranscript: 'version-2',
+    });
+
+    const durableResults = Array.from(repository.durableResults.values()).sort(
+      (left, right) => left.createdAt.getTime() - right.createdAt.getTime(),
+    );
+    expect(durableResults).toHaveLength(2);
+    expect(durableResults[0]?.status).toBe('superseded');
+    expect(durableResults[1]?.status).toBe('ready');
+    expect(durableResults[1]?.result.sourceTranscript).toBe('version-2');
+  });
+
   it('resumes a failed operation from the same operation id when retried', async () => {
     const fixturePath = await createAudioFixture();
     createdFiles.push(fixturePath);
@@ -486,11 +709,11 @@ describe('RemoteOperationService', () => {
     const config = createConfig();
     const dedupeKey = createFingerprint({
       kind: 'transcription',
-      request: {
-        source: { kind: 'http', uri: 'https://example.com/audio.mp3' },
-        provider: 'openai',
-        force: false,
-      },
+      sourceUri: 'https://example.com/audio.mp3',
+      provider: 'openai',
+      model: null,
+      inputLanguage: null,
+      targetLanguage: null,
     });
     const service = new RemoteOperationService(
       config,
@@ -651,6 +874,72 @@ describe('RemoteOperationService', () => {
       kind: 'understanding',
       responseText: 'understood',
     });
+  });
+
+  it('keeps understanding results prompt-specific in the durable cache', async () => {
+    const fixturePath = await createVideoFixture();
+    createdFiles.push(fixturePath);
+    const repository = new InMemoryRepository();
+    const service = new RemoteOperationService(
+      createConfig(),
+      repository as never,
+      {
+        resolverFor: () => ({
+          resolve: async () => ({
+            kind: 'http',
+            canonicalUri: 'https://example.com/video.mp4',
+            displayName: 'Example video',
+            fileName: 'video.mp4',
+            metadata: {},
+          }),
+          materialize: async () => ({
+            localPath: fixturePath,
+            fileName: 'video.mp4',
+          }),
+        }),
+      } as never,
+      {
+        understandingProvider: () => ({
+          resolveModel: () => 'gemini-test',
+          capability: () => ({
+            maxWholeFileDurationMs: 60_000,
+            chunkDurationMs: 60_000,
+            overlapMs: 0,
+          }),
+          understandChunk: async ({ prompt }: { prompt: string }) => ({
+            responseText: `understood:${prompt}`,
+            timeRanges: [{ startMs: 0, endMs: 500, label: 'intro' }],
+          }),
+        }),
+      } as never,
+    );
+
+    await service.initialize();
+    const first = await service.submitUnderstanding({
+      source: { kind: 'http', uri: 'https://example.com/video.mp4' },
+      provider: 'google-gemini',
+      prompt: 'Summarize the clip',
+      force: false,
+    });
+    await waitFor(
+      () => service.getOperationStatus(first.operationId),
+      (value) => value.operation.status === 'completed',
+    );
+
+    await repository.updateOperation(first.operationId, {
+      expiresAt: new Date(Date.now() - 1_000),
+    });
+    await service.cleanupExpiredOperations();
+
+    const second = await service.submitUnderstanding({
+      source: { kind: 'http', uri: 'https://example.com/video.mp4' },
+      provider: 'google-gemini',
+      prompt: 'List key speakers',
+      force: false,
+    });
+
+    expect(second.cacheHit).toBe(false);
+    expect(second.operationId).not.toBe(first.operationId);
   });
 
   it('cleans up expired operations and their working directories', async () => {

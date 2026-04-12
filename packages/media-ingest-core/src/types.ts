@@ -29,6 +29,10 @@ export const stepStatuses = ['pending', 'running', 'completed', 'failed'] as con
 
 export type StepStatus = (typeof stepStatuses)[number];
 
+export const durableResultStatuses = ['ready', 'superseded'] as const;
+
+export type DurableResultStatus = (typeof durableResultStatuses)[number];
+
 export const providerIds = ['openai', 'google-gemini', 'google-speech'] as const;
 
 export type ProviderId = (typeof providerIds)[number];

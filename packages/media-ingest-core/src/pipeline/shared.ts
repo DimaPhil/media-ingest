@@ -206,6 +206,28 @@ export function isUnderstandingStore(
   return store.kind === 'understanding';
 }
 
+export function isTranscriptionRequest(request: AnyRequest): request is TranscriptionRequest {
+  return !('prompt' in request);
+}
+
+export function isUnderstandingRequest(request: AnyRequest): request is UnderstandingRequest {
+  return 'prompt' in request;
+}
+
+export function requireTranscriptionRequest(request: AnyRequest): TranscriptionRequest {
+  if (!isTranscriptionRequest(request)) {
+    throw new Error('Transcription operations require a transcription request');
+  }
+  return request;
+}
+
+export function requireUnderstandingRequest(request: AnyRequest): UnderstandingRequest {
+  if (!isUnderstandingRequest(request)) {
+    throw new Error('Understanding operations require an understanding request');
+  }
+  return request;
+}
+
 export function serializeError(error: unknown): OperationError {
   if (error instanceof Error) {
     return {
@@ -231,7 +253,7 @@ export function buildSteps(kind: OperationKind, request: AnyRequest): OperationS
     'run_chunks',
     'merge_chunks',
   ];
-  if (kind === 'transcription' && 'targetLanguage' in request && request.targetLanguage) {
+  if (kind === 'transcription' && requireTranscriptionRequest(request).targetLanguage) {
     steps.push('translate_transcript');
   }
   steps.push('finalize_result', 'cleanup');
@@ -337,17 +359,15 @@ export function createOperationInput(
   kind: 'understanding',
   request: UnderstandingRequest,
 ): Extract<OperationRequest, { kind: 'understanding' }>;
+export function createOperationInput(
+  kind: OperationKind,
+  request: AnyRequest,
+): OperationRequest;
 export function createOperationInput(kind: OperationKind, request: AnyRequest): OperationRequest {
   if (kind === 'transcription') {
-    if ('prompt' in request) {
-      throw new Error('Transcription operations require a transcription request');
-    }
-    return { kind, request };
+    return { kind, request: requireTranscriptionRequest(request) };
   }
-  if (!('prompt' in request)) {
-    throw new Error('Understanding operations require an understanding request');
-  }
-  return { kind, request };
+  return { kind, request: requireUnderstandingRequest(request) };
 }
 
 export function toStepMap(

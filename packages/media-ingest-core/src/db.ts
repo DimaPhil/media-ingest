@@ -18,6 +18,7 @@ import postgres from 'postgres';
 
 import type { OperationRequest } from './contracts';
 import type {
+  DurableResultStatus,
   OperationError,
   OperationKind,
   OperationResult,
@@ -27,6 +28,27 @@ import type {
   SourceKind,
   StepStatus,
 } from './types';
+
+export const mediaResourcesTable = pgTable(
+  'media_resources',
+  {
+    id: text('id').primaryKey(),
+    resourceKey: text('resource_key').notNull(),
+    kind: text('kind').$type<SourceKind>().notNull(),
+    canonicalUri: text('canonical_uri').notNull(),
+    sourceLocator: jsonb('source_locator').$type<Record<string, unknown>>().notNull(),
+    displayName: text('display_name').notNull(),
+    fileName: text('file_name').notNull(),
+    mimeType: text('mime_type'),
+    metadata: jsonb('metadata').$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    resourceKeyUniq: uniqueIndex('media_resources_resource_key_uidx').on(table.resourceKey),
+    canonicalUriIdx: index('media_resources_canonical_uri_idx').on(table.canonicalUri),
+  }),
+);
 
 export const operationsTable = pgTable(
   'operations',
@@ -39,7 +61,10 @@ export const operationsTable = pgTable(
     model: text('model'),
     sourceType: text('source_type').$type<SourceKind>().notNull(),
     sourceLocator: jsonb('source_locator').$type<Record<string, unknown>>().notNull(),
-    input: jsonb('input').$type<Record<string, unknown>>().notNull(),
+    input: jsonb('input').$type<OperationRequest>().notNull(),
+    mediaResourceId: text('media_resource_id'),
+    resultCacheKey: text('result_cache_key'),
+    durableResultId: text('durable_result_id'),
     result: jsonb('result').$type<OperationResult | null>(),
     error: jsonb('error').$type<OperationError | null>(),
     cacheEnabled: boolean('cache_enabled').notNull().default(true),
@@ -56,6 +81,31 @@ export const operationsTable = pgTable(
   },
   (table) => ({
     dedupeIdx: index('operations_dedupe_key_idx').on(table.dedupeKey),
+  }),
+);
+
+export const durableResultsTable = pgTable(
+  'durable_results',
+  {
+    id: text('id').primaryKey(),
+    mediaResourceId: text('media_resource_id')
+      .notNull()
+      .references(() => mediaResourcesTable.id, { onDelete: 'cascade' }),
+    kind: text('kind').$type<OperationKind>().notNull(),
+    cacheKey: text('cache_key').notNull(),
+    provider: text('provider').$type<ProviderId>().notNull(),
+    model: text('model'),
+    requestInput: jsonb('request_input').$type<Record<string, unknown>>().notNull(),
+    result: jsonb('result').$type<OperationResult>().notNull(),
+    status: text('status').$type<DurableResultStatus>().notNull().default('ready'),
+    sourceOperationId: text('source_operation_id'),
+    supersededAt: timestamp('superseded_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    cacheKeyIdx: index('durable_results_cache_key_idx').on(table.cacheKey),
+    mediaResourceIdx: index('durable_results_media_resource_id_idx').on(table.mediaResourceId),
   }),
 );
 
@@ -100,6 +150,9 @@ export interface PersistedOperation {
   sourceType: SourceKind;
   sourceLocator: Record<string, unknown>;
   input: OperationRequest;
+  mediaResourceId: string | null;
+  resultCacheKey: string | null;
+  durableResultId: string | null;
   result: OperationResult | null;
   error: OperationError | null;
   cacheEnabled: boolean;
@@ -113,6 +166,36 @@ export interface PersistedOperation {
   completedAt: Date | null;
   expiresAt: Date | null;
   lastHeartbeatAt: Date | null;
+}
+
+export interface PersistedMediaResource {
+  id: string;
+  resourceKey: string;
+  kind: SourceKind;
+  canonicalUri: string;
+  sourceLocator: Record<string, unknown>;
+  displayName: string;
+  fileName: string;
+  mimeType: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface PersistedDurableResult {
+  id: string;
+  mediaResourceId: string;
+  kind: OperationKind;
+  cacheKey: string;
+  provider: ProviderId;
+  model: string | null;
+  requestInput: Record<string, unknown>;
+  result: OperationResult;
+  status: DurableResultStatus;
+  sourceOperationId: string | null;
+  supersededAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export interface PersistedOperationStep {
@@ -138,13 +221,29 @@ export interface CreateOperationInput {
   sourceType: SourceKind;
   sourceLocator: Record<string, unknown>;
   input: OperationRequest;
+  mediaResourceId?: string | null;
+  resultCacheKey?: string | null;
+  durableResultId?: string | null;
   cacheEnabled: boolean;
   workingDirectory: string | null;
+  status?: OperationStatus;
+  result?: OperationResult | null;
+  error?: OperationError | null;
+  cacheHit?: boolean;
+  retryable?: boolean;
+  currentStep?: OperationStepName | null;
+  startedAt?: Date | null;
+  completedAt?: Date | null;
+  expiresAt?: Date | null;
+  lastHeartbeatAt?: Date | null;
 }
 
 export interface UpdateOperationInput {
   status?: OperationStatus;
   currentStep?: OperationStepName | null;
+  mediaResourceId?: string | null;
+  resultCacheKey?: string | null;
+  durableResultId?: string | null;
   result?: OperationResult | null;
   error?: OperationError | null;
   retryable?: boolean;
@@ -170,6 +269,28 @@ export interface OperationCounts {
   completed: number;
   failed: number;
   total: number;
+}
+
+export interface UpsertMediaResourceInput {
+  resourceKey: string;
+  kind: SourceKind;
+  canonicalUri: string;
+  sourceLocator: Record<string, unknown>;
+  displayName: string;
+  fileName: string;
+  mimeType?: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface SaveDurableResultInput {
+  mediaResourceId: string;
+  kind: OperationKind;
+  cacheKey: string;
+  provider: ProviderId;
+  model: string | null;
+  requestInput: Record<string, unknown>;
+  result: OperationResult;
+  sourceOperationId: string;
 }
 
 interface AppliedMigrationRow {
@@ -286,21 +407,76 @@ export class OperationsRepository {
         id: randomUUID(),
         dedupeKey: input.dedupeKey,
         kind: input.kind,
-        status: 'queued',
+        status: input.status ?? 'queued',
         provider: input.provider,
         model: input.model,
         sourceType: input.sourceType,
         sourceLocator: input.sourceLocator,
         input: input.input,
+        mediaResourceId: input.mediaResourceId ?? null,
+        resultCacheKey: input.resultCacheKey ?? null,
+        durableResultId: input.durableResultId ?? null,
+        result: input.result ?? null,
+        error: input.error ?? null,
         cacheEnabled: input.cacheEnabled,
-        cacheHit: false,
-        retryable: true,
+        cacheHit: input.cacheHit ?? false,
+        retryable: input.retryable ?? true,
+        currentStep: input.currentStep ?? null,
         workingDirectory: input.workingDirectory,
         createdAt: now,
         updatedAt: now,
+        startedAt: input.startedAt ?? null,
+        completedAt: input.completedAt ?? null,
+        expiresAt: input.expiresAt ?? null,
+        lastHeartbeatAt: input.lastHeartbeatAt ?? null,
       })
       .returning();
     return inserted[0] as PersistedOperation;
+  }
+
+  public async upsertMediaResource(input: UpsertMediaResourceInput): Promise<PersistedMediaResource> {
+    const existing = await this.database.db
+      .select()
+      .from(mediaResourcesTable)
+      .where(eq(mediaResourcesTable.resourceKey, input.resourceKey))
+      .limit(1);
+
+    const now = new Date();
+    if (!existing[0]) {
+      const inserted = await this.database.db
+        .insert(mediaResourcesTable)
+        .values({
+          id: randomUUID(),
+          resourceKey: input.resourceKey,
+          kind: input.kind,
+          canonicalUri: input.canonicalUri,
+          sourceLocator: input.sourceLocator,
+          displayName: input.displayName,
+          fileName: input.fileName,
+          mimeType: input.mimeType ?? null,
+          metadata: input.metadata,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning();
+      return inserted[0] as PersistedMediaResource;
+    }
+
+    const updated = await this.database.db
+      .update(mediaResourcesTable)
+      .set({
+        kind: input.kind,
+        canonicalUri: input.canonicalUri,
+        sourceLocator: input.sourceLocator,
+        displayName: input.displayName,
+        fileName: input.fileName,
+        mimeType: input.mimeType ?? null,
+        metadata: input.metadata,
+        updatedAt: now,
+      })
+      .where(eq(mediaResourcesTable.id, existing[0].id))
+      .returning();
+    return updated[0] as PersistedMediaResource;
   }
 
   public async updateOperation(
@@ -350,6 +526,60 @@ export class OperationsRepository {
       .orderBy(desc(operationsTable.updatedAt))
       .limit(limit);
     return rows as PersistedOperation[];
+  }
+
+  public async findReadyDurableResultByCacheKey(cacheKey: string): Promise<PersistedDurableResult | null> {
+    const rows = await this.database.db
+      .select()
+      .from(durableResultsTable)
+      .where(
+        and(
+          eq(durableResultsTable.cacheKey, cacheKey),
+          eq(durableResultsTable.status, 'ready'),
+        ),
+      )
+      .orderBy(desc(durableResultsTable.createdAt))
+      .limit(1);
+    return (rows[0] as PersistedDurableResult | undefined) ?? null;
+  }
+
+  public async saveDurableResult(input: SaveDurableResultInput): Promise<PersistedDurableResult> {
+    const now = new Date();
+    return this.database.db.transaction(async (transaction) => {
+      await transaction
+        .update(durableResultsTable)
+        .set({
+          status: 'superseded',
+          supersededAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(durableResultsTable.cacheKey, input.cacheKey),
+            eq(durableResultsTable.status, 'ready'),
+          ),
+        );
+
+      const inserted = await transaction
+        .insert(durableResultsTable)
+        .values({
+          id: randomUUID(),
+          mediaResourceId: input.mediaResourceId,
+          kind: input.kind,
+          cacheKey: input.cacheKey,
+          provider: input.provider,
+          model: input.model,
+          requestInput: input.requestInput,
+          result: input.result,
+          status: 'ready',
+          sourceOperationId: input.sourceOperationId,
+          supersededAt: null,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning();
+      return inserted[0] as PersistedDurableResult;
+    });
   }
 
   public async listOperations(filters: ListOperationsInput = {}): Promise<PersistedOperation[]> {
